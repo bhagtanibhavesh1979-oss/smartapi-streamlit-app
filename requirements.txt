@@ -1,0 +1,7 @@
+streamlit
+smartapi-python
+pandas
+numpy
+scipy
+requests
+websocket-client
