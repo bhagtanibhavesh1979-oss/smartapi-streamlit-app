@@ -2,15 +2,17 @@ name: Update Instrument Master
 
 on:
   schedule:
-    - cron: "0 2 * * *"
-  workflow_dispatch:
+    - cron: "0 2 * * *"   # runs daily at 2 AM UTC (≈7:30 AM IST)
+  workflow_dispatch:       # allows manual trigger from Actions tab
 
 jobs:
   update:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
+      - name: Checkout repo with PAT
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
 
       - name: Download latest Instrument Master JSON
         run: curl -s -o OpenAPIScripMaster.json https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json
@@ -21,8 +23,8 @@ jobs:
           git config --global user.email "auto-updater@example.com"
           git add OpenAPIScripMaster.json
           git commit -m "Auto-update Instrument Master JSON" || echo "No changes to commit"
-          git remote set-url origin https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}
           git push
+
 
 
 
