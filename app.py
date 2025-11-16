@@ -3,6 +3,7 @@ import requests
 import pyotp
 import math
 import pandas as pd
+import json
 from datetime import datetime
 
 # Optional auto-refresh: safe fallback if not installed
@@ -66,12 +67,10 @@ def get_headers(api_key, jwt_token):
     }
 
 # ---------------- TOKEN MASTER ----------------
-@st.cache  # Streamlit 1.12-compatible
+@st.cache
 def load_token_master():
-    url = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    with open("OpenAPIScripMaster.json", "r") as f:
+        return json.load(f)
 
 def get_upcoming_expiries(token_data, symbol="NIFTY", lookahead_days=120, count=4):
     expiries = []
