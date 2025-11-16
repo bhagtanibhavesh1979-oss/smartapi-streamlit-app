@@ -1,7 +1,8 @@
-streamlit
+streamlit==1.12.0
 smartapi-python
 pandas
 numpy
-scipy
 requests
+pyotp
 websocket-client
+streamlit-autorefresh
