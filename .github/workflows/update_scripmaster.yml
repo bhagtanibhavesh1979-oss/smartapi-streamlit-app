@@ -24,7 +24,3 @@ jobs:
           git add OpenAPIScripMaster.json
           git commit -m "Auto-update Instrument Master JSON" || echo "No changes to commit"
           git push
-
-
-
-
