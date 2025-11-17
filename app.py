@@ -276,7 +276,9 @@ def implied_vol(S, K, T, r, price, option_type="CE", max_iter=30, tol=1e-6):
 def get_step_for_index(index_choice):
     if index_choice == "BANKNIFTY":
         return 100
-    elif index_choice in ["NIFTY", "FINNIFTY", "SENSEX"]:
+    elif index_choice == "SENSEX":
+        return 100
+    elif index_choice in ["NIFTY", "FINNIFTY"]:
         return 50
     else:
         return 50
