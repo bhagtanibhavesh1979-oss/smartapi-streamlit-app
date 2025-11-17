@@ -3,10 +3,9 @@ import requests
 import pyotp
 import math
 import pandas as pd
-import json
-from datetime import datetime
+from datetime import datetime, date
 
-# Optional auto-refresh: safe fallback if not installed
+# ---------- Optional auto-refresh ----------
 try:
     from streamlit_autorefresh import st_autorefresh
     HAS_AUTOREFRESH = True
@@ -15,21 +14,44 @@ except Exception:
     def st_autorefresh(*args, **kwargs):
         return None
 
+def safe_rerun():
+    fn = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+    if callable(fn):
+        try:
+            fn()
+        except Exception:
+            pass
+
 st.set_page_config(page_title="Index Options Analyzer", layout="wide")
 
-# ---------------- SESSION STATE ----------------
+# ---------- Session defaults ----------
 for key, default in {
     "logged_in": False,
+    "login_date": None,
     "jwt_token": None,
     "headers": None,
     "token_data": None,
     "prev_oi": {},
-    "prev_prices": {},
+    "index_choice": "NIFTY",
+    "expiry_choice": "",
+    "risk_free_rate_pct": 7.0,
+    "strike_count": 5,
+    "auto_refresh": False,
+    "use_atm_iv_for_fair": False,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ---------------- LOGIN ----------------
+# Persist login until midnight
+if st.session_state.get("logged_in"):
+    today_str = date.today().isoformat()
+    if st.session_state.get("login_date") != today_str:
+        st.session_state.logged_in = False
+        st.session_state.jwt_token = None
+        st.session_state.headers = None
+        st.session_state.token_data = None
+
+# ---------- Auth helpers ----------
 def login(api_key, client_code, pin, totp_secret):
     try:
         totp = pyotp.TOTP(totp_secret).now()
@@ -66,49 +88,86 @@ def get_headers(api_key, jwt_token):
         "Authorization": f"Bearer {jwt_token}",
     }
 
-# ---------------- TOKEN MASTER ----------------
-@st.cache
+# ---------- Token master ----------
+@st.cache  # Streamlit 1.12-compatible
 def load_token_master():
-    with open("OpenAPIScripMaster.json", "r") as f:
-        return json.load(f)
+    url = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
 def get_upcoming_expiries(token_data, symbol="NIFTY", lookahead_days=120, count=4):
+    if not token_data:
+        return []
     expiries = []
     for inst in token_data:
-        if inst.get("exch_seg") == "NFO" and inst.get("name") == symbol and inst.get("instrumenttype") == "OPTIDX":
-            expiries.append(inst["expiry"])
-    expiries = sorted(set(expiries), key=lambda x: datetime.strptime(x, "%d%b%Y"))
+        try:
+            inst_exch = (inst.get("exch_seg") or "").upper()
+            inst_type = (inst.get("instrumenttype") or "").upper()
+            inst_name = (inst.get("name") or "").upper()
+            inst_symbol = (inst.get("symbol") or "").upper()
+            # Accept NFO OPTIDX (regular index options) and BFO OPTIDX (SENSEX on BSE derivatives)
+            if inst_type == "OPTIDX" and (inst_exch in ("NFO", "BFO")) and (inst_name == symbol or symbol in inst_symbol):
+                e = (inst.get("expiry") or "").strip()
+                if e:
+                    expiries.append(e)
+        except Exception:
+            continue
+    try:
+        expiries = sorted(set(expiries), key=lambda x: datetime.strptime(x, "%d%b%Y"))
+    except Exception:
+        expiries = list(dict.fromkeys(expiries))
     today = datetime.now()
     filtered = []
     for exp in expiries:
         try:
             exp_date = datetime.strptime(exp, "%d%b%Y")
-            if 0 <= (exp_date - today).days <= lookahead_days:
+            days = (exp_date - today).days
+            if 0 <= days <= lookahead_days:
                 filtered.append(exp)
         except Exception:
             continue
     return filtered[:count] if filtered else expiries[:count]
 
 def find_option_token(token_data, symbol, strike, option_type, expiry):
-    strike_in_master = float(strike) * 100  # Angel stores strike*100
+    if not token_data:
+        return None
+    try:
+        strike_in_master = float(strike) * 100  # master stores strike*100
+    except Exception:
+        strike_in_master = None
     for inst in token_data:
-        if (
-            inst.get("exch_seg") == "NFO"
-            and inst.get("name") == symbol
-            and inst.get("instrumenttype") == "OPTIDX"
-            and inst.get("expiry") == expiry
-            and float(inst.get("strike", 0)) == strike_in_master
-            and option_type in inst.get("symbol", "")
-        ):
-            return inst.get("token")
+        try:
+            inst_exch = (inst.get("exch_seg") or "").upper()
+            inst_type = (inst.get("instrumenttype") or "").upper()
+            inst_name = (inst.get("name") or "").upper()
+            inst_sym = (inst.get("symbol") or "").upper()
+            inst_exp = (inst.get("expiry") or "").strip()
+            inst_strike = inst.get("strike")
+            if inst_type != "OPTIDX" or inst_exch not in ("NFO", "BFO"):
+                continue
+            if inst_exp != expiry:
+                continue
+            if not (inst_name == symbol or symbol in inst_sym):
+                continue
+            try:
+                inst_strike_f = float(inst_strike) if inst_strike is not None else None
+            except Exception:
+                inst_strike_f = None
+            if inst_strike_f is None or strike_in_master is None:
+                continue
+            if inst_strike_f == strike_in_master and option_type in inst_sym:
+                return inst.get("token")
+        except Exception:
+            continue
     return None
 
-# ---------------- MARKET DATA ----------------
+# ---------- Market data ----------
 INDEX_TOKENS = {
     "NIFTY": ("NSE", "99926000"),
     "BANKNIFTY": ("NSE", "99926009"),
     "FINNIFTY": ("NSE", "99926037"),
-    "SENSEX": (None, None),  # Update if you have a valid token
+    "SENSEX": ("BSE", "99919000"),  # your SENSEX spot token
 }
 
 def quote(headers, exchange, tokens):
@@ -119,23 +178,23 @@ def quote(headers, exchange, tokens):
 
 def get_spot_price(headers, symbol="NIFTY"):
     exch, token = INDEX_TOKENS.get(symbol, (None, None))
-    if not exch or not token:
+    if not headers or not exch or not token:
         return None
     try:
         data = quote(headers, exch, [token])
         fetched = data.get("data", {}).get("fetched", [])
         if data.get("status") and fetched:
-            return float(fetched[0].get("ltp"))
+            ltp = fetched[0].get("ltp")
+            return float(ltp) if ltp is not None else None
     except Exception:
-        return None
+        pass
     return None
 
-def get_option_fields(headers, token):
-    # Returns live price and OI if available
-    if not token:
+def get_option_fields(headers, token, exchange="NFO"):
+    if not token or not headers:
         return None, None
     try:
-        data = quote(headers, "NFO", [token])
+        data = quote(headers, exchange, [token])
         fetched = data.get("data", {}).get("fetched", [])
         if data.get("status") and fetched:
             row = fetched[0]
@@ -143,10 +202,10 @@ def get_option_fields(headers, token):
             oi = row.get("oi") or row.get("openinterest")
             return (float(ltp) if ltp is not None else None), (int(oi) if oi is not None else None)
     except Exception:
-        return None, None
+        pass
     return None, None
 
-# ---------------- BLACK-SCHOLES + GREEKS ----------------
+# ---------- Black–Scholes + Greeks ----------
 def norm_pdf(x):
     return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
@@ -159,54 +218,48 @@ def d1_d2(S, K, T, r, sigma):
     return d1, d2
 
 def black_scholes(S, K, T, r, sigma, option_type="CE"):
-    if T <= 0 or S is None or S <= 0 or K <= 0 or sigma <= 0:
+    if S is None or S <= 0 or K <= 0:
         return 0.0
+    if T <= 0:
+        return max(0.0, S - K) if option_type == "CE" else max(0.0, K - S)
+    if sigma is None or sigma <= 0:
+        sigma = 1e-6
     d1, d2 = d1_d2(S, K, T, r, sigma)
     if option_type == "CE":
         return S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)
     else:
         return K * math.exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1)
 
-def greeks(S, K, T, r, sigma, option_type="CE"):
-    if T <= 0 or S is None or S <= 0 or K <= 0 or sigma <= 0:
-        return 0.0, 0.0, 0.0, 0.0
-    d1, d2 = d1_d2(S, K, T, r, sigma)
-    delta = norm_cdf(d1) if option_type == "CE" else norm_cdf(d1) - 1.0
-    gamma = norm_pdf(d1) / (S * sigma * math.sqrt(T))
-    theta_call = (-S * norm_pdf(d1) * sigma / (2 * math.sqrt(T))) - r * K * math.exp(-r * T) * norm_cdf(d2)
-    theta_put = (-S * norm_pdf(d1) * sigma / (2 * math.sqrt(T))) + r * K * math.exp(-r * T) * norm_cdf(-d2)
-    theta = theta_call if option_type == "CE" else theta_put
-    vega = S * norm_pdf(d1) * math.sqrt(T)
-    return delta, gamma, theta, vega
+def delta_only(S, K, T, r, sigma, option_type="CE"):
+    if S is None or S <= 0 or K <= 0 or T < 0:
+        return 0.0
+    if T == 0:
+        if option_type == "CE":
+            return 1.0 if S > K else 0.0
+        else:
+            return -1.0 if S < K else 0.0
+    d1, _ = d1_d2(S, K, T, r, max(sigma, 1e-6))
+    return norm_cdf(d1) if option_type == "CE" else norm_cdf(d1) - 1.0
 
-# ---------------- Implied volatility (Black–Scholes inversion) ----------------
 def implied_vol(S, K, T, r, price, option_type="CE", max_iter=30, tol=1e-6):
-    # Guardrails
     if S is None or S <= 0 or K <= 0 or T <= 0 or price is None or price <= 0:
         return None
-    # No-arbitrage intrinsic bounds
     intrinsic = max(0.0, S - K) if option_type == "CE" else max(0.0, K - S)
-    # If price below intrinsic (or absurdly high), fail gracefully
     if price < intrinsic or price > max(S, K):
         return None
-
-    # Newton-Raphson with clamps
-    sigma = 0.2  # initial guess
-    lower, upper = 0.01, 3.0  # 1% to 300% annualized
+    sigma = 0.2
+    lower, upper = 0.01, 3.0
     for _ in range(max_iter):
         bs = black_scholes(S, K, T, r, sigma, option_type)
-        _, _, _, vega = greeks(S, K, T, r, sigma, option_type)
+        d1, _ = d1_d2(S, K, T, r, sigma)
+        vega = S * norm_pdf(d1) * math.sqrt(T)
         diff = bs - price
         if abs(diff) < tol:
             return sigma
-        if vega < 1e-8:  # avoid division by near-zero
+        if vega < 1e-8:
             break
         sigma = sigma - diff / vega
-        # clamp to bounds
-        if sigma < lower: sigma = lower
-        if sigma > upper: sigma = upper
-
-    # Fallback: bisection if NR didn’t converge
+        sigma = max(lower, min(upper, sigma))
     lo, hi = lower, upper
     for _ in range(max_iter):
         mid = 0.5 * (lo + hi)
@@ -219,11 +272,11 @@ def implied_vol(S, K, T, r, price, option_type="CE", max_iter=30, tol=1e-6):
             lo = mid
     return None
 
-# ---------------- STRIKE LOGIC ----------------
+# ---------- Strikes ----------
 def get_step_for_index(index_choice):
     if index_choice == "BANKNIFTY":
         return 100
-    elif index_choice in ["NIFTY", "FINNIFTY"]:
+    elif index_choice in ["NIFTY", "FINNIFTY", "SENSEX"]:
         return 50
     else:
         return 50
@@ -246,30 +299,23 @@ def build_put_strikes_below_spot(spot, step, count):
     start = round_down_to_step(spot, step) - step
     return [start - i * step for i in range(count)]
 
-# ---------------- SPOT FALLBACK (ATM parity) ----------------
-def infer_spot_from_atm(headers, token_data, index_choice, expiry_choice, step):
-    # Try a few candidate strikes around round anchors; Spot ≈ K + CE - PE
-    anchors = [25000, 40000, 18000]
-    candidates = []
-    for a in anchors:
-        base = round_up_to_step(a, step)
-        candidates += [base - step, base, base + step]
-    candidates = sorted(set([x for x in candidates if x > 0]))
+# ---------- ATM helpers ----------
+def nearest_atm_strike(spot, step):
+    if spot is None or spot <= 0:
+        return None
+    up = round_up_to_step(spot, step)
+    down = round_down_to_step(spot, step)
+    return up if abs(up - spot) <= abs(spot - down) else down
 
-    for K in candidates[:6]:
-        ce_token = find_option_token(token_data, index_choice, K, "CE", expiry_choice)
-        pe_token = find_option_token(token_data, index_choice, K, "PE", expiry_choice)
-        ce_live, _ = get_option_fields(headers, ce_token)
-        pe_live, _ = get_option_fields(headers, pe_token)
-        if ce_live is not None and pe_live is not None:
-            return K + (ce_live - pe_live)
-    return None
+def get_exchange_for_index(index_choice):
+    # Options exchange: NIFTY/BANKNIFTY/FINNIFTY on NFO; SENSEX on BFO
+    return "BFO" if index_choice == "SENSEX" else "NFO"
 
-# ---------------- UI ----------------
-st.title("📈 Index Options Analyzer")
+# ---------- UI ----------
+st.markdown("<h3 style='margin-bottom:6px;'>📈 Index Options Analyzer</h3>", unsafe_allow_html=True)
 
-# Login form only if not logged in
-if not st.session_state.logged_in:
+# Login form
+if not st.session_state.get("logged_in", False):
     with st.form("login_form"):
         api_key = st.text_input("API Key", type="password")
         client_code = st.text_input("Client Code")
@@ -284,180 +330,216 @@ if not st.session_state.logged_in:
             try:
                 st.session_state.token_data = load_token_master()
                 st.session_state.logged_in = True
+                st.session_state.login_date = date.today().isoformat()
                 st.success("Login successful!")
-                st.experimental_rerun()
-            except Exception:
-                st.error("Instrument master load failed. Please retry.")
+                safe_rerun()
+            except Exception as e:
+                st.error(f"Instrument master load failed: {e}")
         else:
-            st.error("Login failed. Please verify API key, client code, PIN, and TOTP secret.")
+            st.error("Login failed. Verify credentials and TOTP.")
 
-# Main app if logged in
-if st.session_state.logged_in:
-    headers = st.session_state.headers
-    token_data = st.session_state.token_data
+# Stop before chain if not logged in
+if not st.session_state.get("logged_in", False):
+    st.info("Please log in to load the option chain and market data.")
+    st.stop()
 
-    # Top controls
-    top_left, top_right = st.columns([6, 2])
-    with top_right:
-        if st.button("Logout"):
-            st.session_state.logged_in = False
-            st.session_state.jwt_token = None
-            st.session_state.headers = None
-            st.session_state.token_data = None
-            st.experimental_rerun()
+headers = st.session_state.get("headers", None)
+token_data = st.session_state.get("token_data", None)
+if not headers:
+    st.warning("Session headers missing. Please log in again or refresh.")
+    st.stop()
 
-    # Refresh toggle + manual button
-    st.markdown("### Refresh controls")
-    auto_refresh = st.checkbox("Enable auto refresh (15s)", value=False)
-    if auto_refresh and HAS_AUTOREFRESH:
-        st_autorefresh(interval=15 * 1000, key="data_refresh")
-        st.info("Auto refresh is ON (every 15 seconds).")
-    elif auto_refresh and not HAS_AUTOREFRESH:
-        st.warning("Auto refresh library not installed. Run: pip install streamlit-autorefresh")
+# Spot strip under logo
+spot_symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
+spots = {sym: get_spot_price(headers, sym) for sym in spot_symbols}
+strip_cols = st.columns(len(spot_symbols))
+for i, sym in enumerate(spot_symbols):
+    val = spots.get(sym, None)
+    strip_cols[i].metric(sym, "N/A" if val is None else f"₹{val:.2f}")
+
+# Filters
+f1, f2, f3 = st.columns([2, 2, 1])
+with f1:
+    st.session_state.index_choice = st.selectbox("Index", spot_symbols, index=spot_symbols.index(st.session_state.index_choice))
+with f2:
+    expiries = get_upcoming_expiries(token_data, st.session_state.index_choice, lookahead_days=120, count=4)
+    if not expiries:
+        expiries = get_upcoming_expiries(token_data, st.session_state.index_choice, lookahead_days=365, count=4)
+    st.session_state.expiry_choice = st.selectbox("Expiry", expiries, index=0 if expiries else 0)
+with f3:
+    if st.button("🔄 Refresh"):
+        safe_rerun()
+
+# Collapsible parameters with number inputs
+with st.expander("⚙️ Parameters", expanded=False):
+    c1, c2, c3 = st.columns([2, 2, 2])
+    with c1:
+        st.session_state.risk_free_rate_pct = st.number_input(
+            "Risk-Free Rate (%)", min_value=0.0, max_value=12.0, value=float(st.session_state.risk_free_rate_pct), step=0.1
+        )
+    with c2:
+        default_sc = 8 if st.session_state.index_choice == "BANKNIFTY" else int(st.session_state.strike_count)
+        st.session_state.strike_count = st.number_input(
+            "Strikes each side", min_value=3, max_value=15, value=int(default_sc), step=1
+        )
+    with c3:
+        st.session_state.auto_refresh = st.checkbox("Auto refresh (15s)", value=st.session_state.auto_refresh)
+        if st.session_state.auto_refresh and HAS_AUTOREFRESH:
+            st_autorefresh(interval=15 * 1000, key="data_refresh")
+        elif st.session_state.auto_refresh and not HAS_AUTOREFRESH:
+            st.warning("Auto refresh library not installed. Run: pip install streamlit-autorefresh")
+    st.session_state.use_atm_iv_for_fair = st.checkbox("Use ATM IV for Fair Value (auto)", value=st.session_state.use_atm_iv_for_fair)
+
+# Variables
+index_choice = st.session_state.index_choice
+expiry_choice = (st.session_state.expiry_choice or "").strip().upper()
+risk_free_rate = float(st.session_state.risk_free_rate_pct) / 100.0
+strike_count = int(st.session_state.strike_count)
+opt_exchange = get_exchange_for_index(index_choice)
+
+# Days to expiry (inclusive)
+try:
+    exp_d = datetime.strptime(expiry_choice, "%d%b%Y").date()
+    today_d = date.today()
+    days_to_expiry = max((exp_d - today_d).days, 0)  # example: 25-16 = 9
+except Exception:
+    days_to_expiry = 0
+T = days_to_expiry / 365.0
+
+# Spot resolution
+step = get_step_for_index(index_choice)
+spot = get_spot_price(headers, index_choice)
+if (spot is None or spot == 0) and token_data:
+    inferred_spot = None
+    # Try ATM parity only for indices with NFO/BFO options
+    K_atm = nearest_atm_strike(spot if spot else 0, step)
+    if K_atm and expiry_choice:
+        ce_token = find_option_token(token_data, index_choice, K_atm, "CE", expiry_choice)
+        pe_token = find_option_token(token_data, index_choice, K_atm, "PE", expiry_choice)
+        ce_live, _ = get_option_fields(headers, ce_token, exchange=opt_exchange)
+        pe_live, _ = get_option_fields(headers, pe_token, exchange=opt_exchange)
+        if ce_live is not None and pe_live is not None:
+            inferred_spot = K_atm + (ce_live - pe_live)
+    if inferred_spot:
+        spot = inferred_spot
+        st.warning(f"{index_choice} spot unavailable; using inferred spot ≈ ₹{spot:.2f} from ATM parity.")
     else:
-        if st.button("🔄 Refresh data"):
-            st.experimental_rerun()
+        st.info("Spot unavailable (market closed or rate limit). Using anchor strikes to display table.")
 
-    # Option chain controls
-    st.markdown("### Option chain")
-    left, right = st.columns([2, 2])
-    with left:
-        index_choice = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"])
-        expiries = get_upcoming_expiries(token_data, index_choice, lookahead_days=120, count=4)
-        if not expiries:
-            st.warning("No upcoming expiries in 120 days. Showing available expiries.")
-            expiries = get_upcoming_expiries(token_data, index_choice, lookahead_days=365, count=4)
-        expiry_choice = st.selectbox("Expiry", expiries)
-    with right:
-        risk_free_rate = st.slider("Risk-Free Rate (%)", 5.0, 10.0, 7.0) / 100.0
-        volatility = st.slider("Model Volatility (%)", 10.0, 40.0, 18.0) / 100.0
-        strike_count = st.slider("Strikes each side", 3, 15, 8 if index_choice == "BANKNIFTY" else 5)
-        alert_misprice = st.slider("Mispricing alert threshold (₹)", 5, 200, 50)
-        alert_oi_jump = st.slider("OI surge alert threshold (%)", 5, 500, 50)
+st.markdown(f"**Selected index:** {index_choice}   |   **Spot:** {'N/A' if spot is None else f'₹{spot:.2f}'}   |   **Expiry:** {expiry_choice or '(none)'}   |   **Days left:** {days_to_expiry}")
 
-    # IV toggle and settings
-    st.markdown("### Implied volatility settings")
-    show_iv = st.checkbox("Compute implied volatility (from live prices)", value=True)
-    iv_max_iter = st.slider("IV max iterations", 10, 60, 30)
-    iv_tol = 1e-6  # fixed tolerance for stability
-
-    # Spot + fallback
-    step = get_step_for_index(index_choice)
-    spot = get_spot_price(headers, index_choice)
-    if spot is None and index_choice != "SENSEX":
-        inferred_spot = infer_spot_from_atm(headers, token_data, index_choice, expiry_choice, step)
-        if inferred_spot:
-            spot = inferred_spot
-            st.warning(f"Spot unavailable; using inferred spot ≈ ₹{spot:.2f} from ATM parity.")
-        else:
-            st.warning("Spot unavailable (market closed or rate limit). Live prices may be N/A; fair values still compute.")
-    st.info(f"{index_choice} Spot: {'N/A' if spot is None else f'₹{spot:.2f}'}")
-
-    # Build CE/PE strike lists
+# Build strikes (fallback to anchors if spot missing)
+if spot and spot > 0:
     ce_strikes = build_call_strikes_above_spot(spot, step, strike_count)
     pe_strikes = build_put_strikes_below_spot(spot, step, strike_count)
+else:
+    anchors = {"NIFTY": 17000, "BANKNIFTY": 46000, "FINNIFTY": 27500, "SENSEX": 77000}
+    centre = round_up_to_step(anchors.get(index_choice, 17000), step)
+    half = max(3, strike_count // 2)
+    strikes = [centre + (i - half) * step for i in range(2 * half + 1)]
+    strikes_sorted = sorted(set([s for s in strikes if s > 0]))
+    ce_strikes = [s for s in strikes_sorted if s >= centre][:strike_count]
+    pe_strikes = [s for s in list(reversed(strikes_sorted)) if s <= centre][:strike_count]
 
-    # Time to expiry
-    try:
-        days_to_expiry = (datetime.strptime(expiry_choice, "%d%b%Y") - datetime.now()).days
-    except Exception:
-        days_to_expiry = 0
-    T = max(days_to_expiry, 0) / 365.0
+# ATM IV auto-estimation (optional) for Fair Value sigma
+sigma_model = 0.18
+if st.session_state.use_atm_iv_for_fair and spot and T > 0:
+    K_atm = nearest_atm_strike(spot, step)
+    if K_atm:
+        ce_token = find_option_token(token_data, index_choice, K_atm, "CE", expiry_choice)
+        pe_token = find_option_token(token_data, index_choice, K_atm, "PE", expiry_choice)
+        ce_live, _ = get_option_fields(headers, ce_token, exchange=opt_exchange)
+        pe_live, _ = get_option_fields(headers, pe_token, exchange=opt_exchange)
+        ivs = []
+        if ce_live:
+            iv_ce = implied_vol(spot, K_atm, T, risk_free_rate, ce_live, "CE")
+            if iv_ce: ivs.append(iv_ce)
+        if pe_live:
+            iv_pe = implied_vol(spot, K_atm, T, risk_free_rate, pe_live, "PE")
+            if iv_pe: ivs.append(iv_pe)
+        if ivs:
+            sigma_model = max(0.05, min(1.0, sum(ivs) / len(ivs)))  # clamp 5%–100% for stability
 
-    # Build Calls table
-    call_rows = []
-    alerts = []
-    for K in ce_strikes:
-        ce_token = find_option_token(token_data, index_choice, K, "CE", expiry_choice)
-        ce_live, ce_oi = get_option_fields(headers, ce_token)
-        ce_fair = black_scholes(spot if spot else K, K, T, risk_free_rate, volatility, "CE")
-        ce_delta, ce_gamma, ce_theta, ce_vega = greeks(spot if spot else K, K, T, risk_free_rate, volatility, "CE")
+alerts = []
 
-        if ce_live is not None and abs(ce_live - ce_fair) >= alert_misprice:
-            alerts.append(f"CE mispricing at {K}: Live {ce_live:.2f} vs Fair {ce_fair:.2f}")
+# Calls table
+call_rows = []
+for K in ce_strikes:
+    token = find_option_token(token_data, index_choice, K, "CE", expiry_choice) if token_data else None
+    live, oi = get_option_fields(headers, token, exchange=opt_exchange)
+    fair = black_scholes(spot if spot else K, K, T, risk_free_rate, sigma_model, "CE")
+    if fair == 0.0:
+        alerts.append(f"Fair value is 0 at CE {K}. Check inputs (spot/T).")
+    if live is not None and fair is not None and fair > live:
+        alerts.append(f"CE {K}: Fair ({fair:.2f}) > Live ({live:.2f})")
+    dlt = delta_only(spot if spot else K, K, T, risk_free_rate, sigma_model, "CE")
+    iv = None
+    if live is not None and T > 0 and (spot if spot else K) > 0:
+        iv = implied_vol(spot if spot else K, K, T, risk_free_rate, live, "CE")
+    call_rows.append({
+        "Strike": K,
+        "Live": round(live, 2) if live is not None else None,
+        "Fair": round(fair, 2) if fair is not None else None,
+        "Delta": round(dlt, 4),
+        "IV (%)": round(iv * 100, 2) if iv is not None else None,
+        "OI": oi,
+    })
+calls_df = pd.DataFrame(call_rows)
 
-        key = (index_choice, expiry_choice, K, "CE")
-        prev = st.session_state.prev_oi.get(key)
-        if prev and ce_oi and prev > 0:
-            change_pct = ((ce_oi - prev) / prev) * 100.0
-            if change_pct >= alert_oi_jump:
-                alerts.append(f"CE OI surge at {K}: {change_pct:.1f}% (prev {prev}, now {ce_oi})")
-        if ce_oi is not None:
-            st.session_state.prev_oi[key] = ce_oi
+# Puts table
+put_rows = []
+for K in pe_strikes:
+    token = find_option_token(token_data, index_choice, K, "PE", expiry_choice) if token_data else None
+    live, oi = get_option_fields(headers, token, exchange=opt_exchange)
+    fair = black_scholes(spot if spot else K, K, T, risk_free_rate, sigma_model, "PE")
+    if fair == 0.0:
+        alerts.append(f"Fair value is 0 at PE {K}. Check inputs (spot/T).")
+    if live is not None and fair is not None and fair > live:
+        alerts.append(f"PE {K}: Fair ({fair:.2f}) > Live ({live:.2f})")
+    dlt = delta_only(spot if spot else K, K, T, risk_free_rate, sigma_model, "PE")
+    iv = None
+    if live is not None and T > 0 and (spot if spot else K) > 0:
+        iv = implied_vol(spot if spot else K, K, T, risk_free_rate, live, "PE")
+    put_rows.append({
+        "Strike": K,
+        "Live": round(live, 2) if live is not None else None,
+        "Fair": round(fair, 2) if fair is not None else None,
+        "Delta": round(dlt, 4),
+        "IV (%)": round(iv * 100, 2) if iv is not None else None,
+        "OI": oi,
+    })
+puts_df = pd.DataFrame(put_rows)
 
-        # Optional IV
-        iv = None
-        if show_iv and ce_live is not None and T > 0:
-            iv = implied_vol(spot if spot else K, K, T, risk_free_rate, ce_live, "CE", max_iter=iv_max_iter, tol=iv_tol)
+# Alerts
+if alerts:
+    st.markdown("### Alerts")
+    for msg in alerts[:20]:
+        st.warning(msg)
 
-        call_rows.append({
-            "Strike": K,
-            "Live": round(ce_live, 2) if ce_live is not None else None,
-            "Fair": round(ce_fair, 2),
-            "Δ": round(ce_delta, 4),
-            "Γ": round(ce_gamma, 6),
-            "Θ (per day)": round(ce_theta / 365.0, 4),
-            "Vega": round(ce_vega, 4),
-            "OI": ce_oi,
-            "IV (%)": round(iv * 100, 2) if iv is not None else None,
-        })
-    calls_df = pd.DataFrame(call_rows)
+# Layout: side-by-side tables
+t1, t2 = st.columns(2)
+with t1:
+    st.markdown("### Calls (CE)")
+    st.dataframe(calls_df, height=420)
+    st.download_button("Download CE CSV", calls_df.to_csv(index=False), "calls.csv", "text/csv")
+with t2:
+    st.markdown("### Puts (PE)")
+    st.dataframe(puts_df, height=420)
+    st.download_button("Download PE CSV", puts_df.to_csv(index=False), "puts.csv", "text/csv")
 
-    # Build Puts table
-    put_rows = []
-    for K in pe_strikes:
-        pe_token = find_option_token(token_data, index_choice, K, "PE", expiry_choice)
-        pe_live, pe_oi = get_option_fields(headers, pe_token)
-        pe_fair = black_scholes(spot if spot else K, K, T, risk_free_rate, volatility, "PE")
-        pe_delta, pe_gamma, pe_theta, pe_vega = greeks(spot if spot else K, K, T, risk_free_rate, volatility, "PE")
+# Footer metrics
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Index", index_choice)
+m2.metric("Spot", "N/A" if spot is None else f"₹{spot:.2f}")
+m3.metric("Expiry", expiry_choice or "(none)")
+m4.metric("Days left", days_to_expiry)
 
-        if pe_live is not None and abs(pe_live - pe_fair) >= alert_misprice:
-            alerts.append(f"PE mispricing at {K}: Live {pe_live:.2f} vs Fair {pe_fair:.2f}")
-
-        key = (index_choice, expiry_choice, K, "PE")
-        prev = st.session_state.prev_oi.get(key)
-        if prev and pe_oi and prev > 0:
-            change_pct = ((pe_oi - prev) / prev) * 100.0
-            if change_pct >= alert_oi_jump:
-                alerts.append(f"PE OI surge at {K}: {change_pct:.1f}% (prev {prev}, now {pe_oi})")
-        if pe_oi is not None:
-            st.session_state.prev_oi[key] = pe_oi
-
-        iv = None
-        if show_iv and pe_live is not None and T > 0:
-            iv = implied_vol(spot if spot else K, K, T, risk_free_rate, pe_live, "PE", max_iter=iv_max_iter, tol=iv_tol)
-
-        put_rows.append({
-            "Strike": K,
-            "Live": round(pe_live, 2) if pe_live is not None else None,
-            "Fair": round(pe_fair, 2),
-            "Δ": round(pe_delta, 4),
-            "Γ": round(pe_gamma, 6),
-            "Θ (per day)": round(pe_theta / 365.0, 4),
-            "Vega": round(pe_vega, 4),
-            "OI": pe_oi,
-            "IV (%)": round(iv * 100, 2) if iv is not None else None,
-        })
-    puts_df = pd.DataFrame(put_rows)
-
-    # Alerts section
-    if alerts:
-        st.markdown("### Alerts")
-        for msg in alerts:
-            st.warning(msg)
-
-    # Tables + downloads (wider for readability)
-    st.markdown("### Calls (strikes above spot)")
-    st.dataframe(calls_df, width=1600, height=420)
-    st.download_button("Download Calls CSV", calls_df.to_csv(index=False), "calls.csv", "text/csv")
-
-    st.markdown("### Puts (strikes below spot)")
-    st.dataframe(puts_df, width=1600, height=420)
-    st.download_button("Download Puts CSV", puts_df.to_csv(index=False), "puts.csv", "text/csv")
-
-    # Footer metrics
-    cA, cB, cC, cD = st.columns(4)
-    cA.metric("Selected index", index_choice)
-    cB.metric("Spot", "N/A" if spot is None else f"₹{spot:.2f}")
-    cC.metric("Expiry", expiry_choice)
-    cD.metric("Days to expiry", max(days_to_expiry, 0))
+# Logout
+bcols = st.columns([1, 1, 1, 1])
+with bcols[-1]:
+    if st.button("Logout"):
+        st.session_state.logged_in = False
+        st.session_state.jwt_token = None
+        st.session_state.headers = None
+        st.session_state.token_data = None
+        safe_rerun()
